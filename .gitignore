@@ -1,0 +1,48 @@
+# Secrets, never commit
+.env
+.env.*
+!.env.example
+credentials.json
+*.pem
+*.key
+*.p12
+
+# Terraform state contains secrets and resource IDs
+*.tfstate
+*.tfstate.*
+.terraform/
+.terraform.lock.hcl
+*.tfvars
+!*.tfvars.example
+
+# Recorded API responses and replay corpus
+data/raw/
+data/processed/
+data/replay/
+*.json.gz
+
+# Build artifacts
+target/
+build/
+.gradle/
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+node_modules/
+.next/
+out/
+*.class
+*.jar
+
+# Test and coverage
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# Local
+.DS_Store
+.idea/
+*.log
