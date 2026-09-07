@@ -63,3 +63,11 @@ changed and why, not just what.
 
 Never commit `.env`, `credentials.json`, `*.tfstate`, or any key material.
 `.env.example` documents every required variable with no values.
+
+## Progress tracking
+
+`docs/progress.md` is the current state of the build. Read it at the start of
+every session to know where things stand. When a budgeted item from
+`docs/phase1-build-spec.md` section 9 is complete and verified, tick its box in
+`docs/progress.md` in the same commit as the work. Do not tick an item that has
+not been verified by running it.

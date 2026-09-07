@@ -1,0 +1,188 @@
+# NavCharge Phase 1 stack. Local Docker Compose only.
+#
+# Host ports come from .env where .env.example documents a variable for them.
+# In-network hostnames are hardcoded to the compose service names, so the
+# POSTGRES_HOST, MONGO_URI, REDIS_HOST, and KAFKA_BOOTSTRAP_SERVERS values in
+# .env stay host-oriented for tools that run outside the network: psql, pytest,
+# the seed scripts, and curl.
+
+name: navcharge
+
+services:
+  postgres:
+    image: postgis/postgis:16-3.4
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-navcharge}
+      POSTGRES_USER: ${POSTGRES_USER:-navcharge}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is not set, copy .env.example to .env and fill it in}
+      # So that psql inside the container needs no connection flags, which keeps
+      # make migrate and make seed free of credential handling.
+      PGUSER: ${POSTGRES_USER:-navcharge}
+      PGDATABASE: ${POSTGRES_DB:-navcharge}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      # Migrations and seed SQL are applied by make, not by the image entrypoint,
+      # so that they can be re-run against a warm volume.
+      - ./db/postgres:/db/postgres:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+
+  mongo:
+    image: mongo:7
+    command: ["mongod", "--bind_ip_all"]
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo_data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+
+  redis:
+    image: redis:7-alpine
+    # The dedupe window is deliberately not durable. Losing it on restart costs
+    # a replayed duplicate, which the outbox and the charge function tolerate.
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+  kafka:
+    image: bitnami/kafka:3.7
+    environment:
+      # KRaft, single combined broker and controller node. No ZooKeeper.
+      KAFKA_CFG_NODE_ID: "0"
+      KAFKA_CFG_PROCESS_ROLES: controller,broker
+      KAFKA_CFG_CONTROLLER_QUORUM_VOTERS: 0@kafka:9093
+      KAFKA_CFG_LISTENERS: INTERNAL://:9092,CONTROLLER://:9093,EXTERNAL://:9094
+      KAFKA_CFG_ADVERTISED_LISTENERS: INTERNAL://kafka:9092,EXTERNAL://localhost:9092
+      KAFKA_CFG_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_CFG_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_CFG_INTER_BROKER_LISTENER_NAME: INTERNAL
+      # Topics are created by make topics with the partition counts in
+      # docs/phase1-build-spec.md section 4. Auto-creation would silently give
+      # every topic one partition and hide the ordering guarantee we depend on.
+      KAFKA_CFG_AUTO_CREATE_TOPICS_ENABLE: "false"
+      KAFKA_CFG_OFFSETS_TOPIC_REPLICATION_FACTOR: "1"
+      KAFKA_CFG_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: "1"
+      KAFKA_CFG_TRANSACTION_STATE_LOG_MIN_ISR: "1"
+      KAFKA_CFG_GROUP_INITIAL_REBALANCE_DELAY_MS: "0"
+      ALLOW_PLAINTEXT_LISTENER: "yes"
+    ports:
+      # Host clients reach the broker on localhost:9092, which is what
+      # KAFKA_BOOTSTRAP_SERVERS in .env.example says.
+      - "9092:9094"
+    volumes:
+      - kafka_data:/bitnami/kafka
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-topics.sh --bootstrap-server localhost:9092 --list > /dev/null 2>&1"]
+      interval: 10s
+      timeout: 10s
+      retries: 18
+      start_period: 30s
+
+  kafka-ui:
+    image: provectuslabs/kafka-ui:v0.7.2
+    depends_on:
+      kafka:
+        condition: service_healthy
+    environment:
+      KAFKA_CLUSTERS_0_NAME: navcharge-local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
+      DYNAMIC_CONFIG_ENABLED: "true"
+      SERVER_SERVLET_CONTEXT_PATH: /
+    ports:
+      # 8080 on the host belongs to the admission service.
+      - "8081:8080"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O - http://localhost:8080/actuator/health | grep -q UP"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+
+  admission:
+    build:
+      context: ./services/admission
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    environment:
+      SPRING_PROFILES_ACTIVE: docker
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: "5432"
+      POSTGRES_DB: ${POSTGRES_DB:-navcharge}
+      POSTGRES_USER: ${POSTGRES_USER:-navcharge}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      KAFKA_TOPIC_POSITIONS: ${KAFKA_TOPIC_POSITIONS:-usage.positions.v1}
+      KAFKA_TOPIC_DLQ: ${KAFKA_TOPIC_DLQ:-usage.positions.dlq}
+      IDEMPOTENCY_WINDOW_SECONDS: ${IDEMPOTENCY_WINDOW_SECONDS:-900}
+      ADMISSION_HTTP_PORT: "8080"
+      ADMISSION_GRPC_PORT: "9090"
+    ports:
+      - "${ADMISSION_HTTP_PORT:-8080}:8080"
+      - "${ADMISSION_GRPC_PORT:-9090}:9090"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O - http://localhost:8080/actuator/health | grep -q UP"]
+      interval: 10s
+      timeout: 5s
+      retries: 18
+      start_period: 45s
+
+  rating:
+    build:
+      context: ./services/rating
+    depends_on:
+      postgres:
+        condition: service_healthy
+      mongo:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: "5432"
+      POSTGRES_DB: ${POSTGRES_DB:-navcharge}
+      POSTGRES_USER: ${POSTGRES_USER:-navcharge}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      MONGO_URI: mongodb://mongo:27017
+      MONGO_DB: ${MONGO_DB:-navcharge_rates}
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      KAFKA_TOPIC_POSITIONS: ${KAFKA_TOPIC_POSITIONS:-usage.positions.v1}
+      KAFKA_TOPIC_CHARGES: ${KAFKA_TOPIC_CHARGES:-billing.charges.v1}
+      KAFKA_TOPIC_DLQ: ${KAFKA_TOPIC_DLQ:-usage.positions.dlq}
+      PYTHONUNBUFFERED: "1"
+    # No healthcheck. The Phase 1 rating consumer exposes no port, so there is
+    # nothing to probe, and nothing depends on it being healthy. It gets one
+    # when it gets a metrics endpoint.
+
+volumes:
+  postgres_data:
+  mongo_data:
+  kafka_data:
+
+networks:
+  # Named explicitly so that one-shot containers, such as the Mongo seed runner,
+  # can join it by a stable name.
+  default:
+    name: navcharge
